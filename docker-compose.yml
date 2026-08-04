@@ -1,0 +1,66 @@
+name: restaurant-reservations
+
+services:
+  postgres:
+    # Community multi-arch build of the official postgis image. The upstream
+    # postgis/postgis publishes amd64 only, which means emulation (and unusable
+    # EXPLAIN ANALYZE timings) on Apple Silicon.
+    image: imresamu/postgis:16-3.5
+    container_name: rr-postgres
+    environment:
+      POSTGRES_DB: restaurant_reservations
+      POSTGRES_USER: rr_app
+      POSTGRES_PASSWORD: rr_password
+      # Deterministic clock for the seed data and for reproducible EXPLAIN runs.
+      TZ: UTC
+      PGTZ: UTC
+    # 5433 on the host: 5432 is often already taken by a local Postgres install.
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Mounted (not auto-run) so scripts/db.sh can re-apply the schema at will.
+      - ./sql:/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rr_app -d restaurant_reservations"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # Day 3: caches table availability per (restaurant, date, slot).
+  redis:
+    image: redis:7-alpine
+    container_name: rr-redis
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # Day 3: stores long-form customer feedback keyed back to reviews.body_ref.
+  mongo:
+    image: mongo:7
+    container_name: rr-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: rr_app
+      MONGO_INITDB_ROOT_PASSWORD: rr_password
+      MONGO_INITDB_DATABASE: restaurant_feedback
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pg_data:
+  redis_data:
+  mongo_data:
