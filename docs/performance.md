@@ -71,9 +71,12 @@ with the index:     0.082 ms,  18 buffers   [reservations_no_double_booking]
 index disabled:     1.342 ms, 127 buffers   [seq scan]
 ```
 
-Roughly **16–18× faster across runs, and 7× fewer pages touched.** The buffer
-ratio is the number to trust; the timing ratio moved between 16.4× and 18.3× on
-repeat runs.
+Roughly **15–18× faster across runs, and 7× fewer pages touched.** The buffer
+ratio is the number to trust: the timing ratio was observed at 15.2×, 16.4×,
+16.6× and 18.3× on repeat runs, including one on a freshly rebuilt database,
+while the buffer counts (18 vs 127) did not move at all. That gap between a
+stable structural measure and a noisy temporal one is the reason `explain.py`
+reports both.
 
 The index doing the work is not one anybody added for reads. It is the GiST
 index Postgres created automatically to enforce:

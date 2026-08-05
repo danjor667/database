@@ -13,9 +13,25 @@ analytical queries with measured tuning.
 Requires Docker.
 
 ```bash
-./scripts/db.sh up      # start postgres + redis + mongo
-./scripts/db.sh reset   # create schema, then load seed data
-./scripts/db.sh psql    # interactive shell
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+./scripts/db.sh up                                # postgres + redis + mongo
+./scripts/db.sh reset                             # schema, then seed data
+.venv/bin/python scripts/backfill_feedback.py     # give the reviews their prose
+```
+
+**The backfill is part of setup, not an extra.** `06_seed.sql` fabricates
+`reviews.body_ref` with `substr(md5(...), 1, 24)` — valid ObjectId *format*
+pointing at nothing — so a database that has only been `reset` carries ~2,650
+dangling cross-store references, and `reconcile()` will report every one. It is a
+separate step because `db.sh` is pure Docker and psql, with no dependency on
+Python or on MongoDB being reachable.
+
+Then:
+
+```bash
+.venv/bin/python -m pytest                        # 89 tests
+./scripts/db.sh psql                              # interactive shell
 ```
 
 Verify the schema's invariants (16 checks, runs in a rolled-back transaction):
