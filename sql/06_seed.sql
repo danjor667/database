@@ -353,7 +353,9 @@ SELECT s.table_id,
 -- -----------------------------------------------------------------------------
 -- Each restaurant gets a hidden quality baseline derived from its id, so the
 -- per-city RANK() in Day 4 has a stable, non-tied ordering to discover.
--- body_ref stands in for a MongoDB ObjectId; Day 3 backfills the real documents.
+-- body_ref is a fabricated ObjectId: valid in format, pointing at nothing. Run
+-- scripts/backfill_feedback.py to write the documents and repoint these, or
+-- app.feedback.reconcile() will report every one of them as dangling.
 INSERT INTO reviews (reservation_id, rating, food_rating, service_rating,
                      ambience_rating, title, body_ref, created_at)
 SELECT res.reservation_id,

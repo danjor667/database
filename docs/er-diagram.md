@@ -245,8 +245,11 @@ Two rules span tables and therefore cannot be `CHECK` constraints — they live 
 
 At current seed volume the planner correctly ignores some of these — 96
 `restaurant_tables` rows fit in three pages, so a sequential scan beats an index
-lookup. That is the right choice, not a defect; Day 4 revisits which indexes earn
-their keep under load.
+lookup. That is the right choice, not a defect. Measured outcomes for every
+index here are in [`docs/performance.md`](performance.md): the exclusion
+constraint's GiST index earns its keep on 9.5k reservations (index-only scan,
+0 heap fetches, 16-18x faster than a forced sequential scan), while
+`idx_restaurants_location` needs ~50k rows before the planner will touch it.
 
 ---
 
@@ -266,5 +269,6 @@ Scoped out of Day 1, listed so they are not mistaken for oversights:
   here a booking maps to exactly one table.
 - **No waitlist, deposits, or partial-party seating.**
 - **`reviews.body_ref` is format-checked but not referentially enforced** — no
-  database can enforce a foreign key into MongoDB. Day 3 owns keeping the two
-  stores consistent.
+  database can enforce a foreign key into MongoDB. `app.feedback.reconcile()`
+  stands in for that constraint by checking it on demand; see the Day 3 section
+  of the README.

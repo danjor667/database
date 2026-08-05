@@ -1,9 +1,12 @@
 -- =============================================================================
 -- 04_indexes.sql — access paths
 -- =============================================================================
--- Every index here is justified by a query the lab actually runs. Day 4 revisits
--- these with EXPLAIN ANALYZE; the point of writing them down now is to have a
--- baseline to argue against.
+-- Every index here is justified by a query the lab actually runs, and every one
+-- has since been measured -- see docs/performance.md. Two carry the load at seed
+-- volume (the exclusion constraint's GiST index, and
+-- idx_reservations_customer_recent); the rest are correctly ignored by the
+-- planner until the tables are larger, which scripts/explain.py --scale
+-- demonstrates.
 --
 -- Already created implicitly and therefore NOT repeated below:
 --   * primary keys and UNIQUE constraints (btree)

@@ -67,8 +67,6 @@ from .models import Reservation
 
 log = logging.getLogger(__name__)
 
-_BLOCKING_STATUSES = ("pending", "confirmed", "seated", "completed")
-
 # Contention signals, all meaning "the transaction was rolled back, nothing was
 # written, try again" — never "the request was invalid".
 #
