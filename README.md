@@ -3,7 +3,8 @@
 Database Fundamentals lab. PostgreSQL for the transactional core, Redis for
 availability caching, MongoDB for long-form review prose.
 
-**Status:** Days 1–2 complete (schema + transactional booking). Days 3–4 pending.
+**Status:** Days 1–3 complete (schema, transactional booking, Redis + MongoDB).
+Day 4 pending.
 
 ---
 
@@ -28,7 +29,7 @@ docker compose exec -T postgres \
 
 | Service | Host port | Credentials |
 |---|---|---|
-| PostgreSQL 16 + PostGIS 3.4 | `5433` | `rr_app` / `rr_password`, db `restaurant_reservations` |
+| PostgreSQL 16 + PostGIS 3.5 | `5433` | `rr_app` / `rr_password`, db `restaurant_reservations` |
 | Redis 7 | `6379` | none |
 | MongoDB 7 | `27017` | `rr_app` / `rr_password`, db `restaurant_feedback` |
 
@@ -38,12 +39,12 @@ Postgres is on **5433**, not 5432, to avoid clashing with a local install.
 postgresql://rr_app:rr_password@localhost:5433/restaurant_reservations
 ```
 
-> **Apple Silicon note.** `postgis/postgis` publishes amd64 only, so on arm64 it
-> runs under emulation. Correctness is unaffected, but the wall-clock numbers
-> `EXPLAIN ANALYZE` reports on Day 4 will be inflated and noisier than native.
-> For timing-sensitive work, switch the image to `imresamu/postgis:16-3.5` (the
-> community multi-arch build of the same thing) and `./scripts/db.sh nuke && up
-> && reset`.
+> **Apple Silicon note.** The compose file already pins
+> `imresamu/postgis:16-3.5`, the community multi-arch build, for this reason:
+> the upstream `postgis/postgis` publishes amd64 only, so on arm64 it runs under
+> emulation. Correctness is unaffected either way, but the wall-clock numbers
+> `EXPLAIN ANALYZE` reports on Day 4 would be inflated and noisier than native.
+> If you switch back to the upstream image, expect exactly that.
 
 ### `scripts/db.sh`
 
@@ -54,6 +55,7 @@ postgresql://rr_app:rr_password@localhost:5433/restaurant_reservations
 | `seed` | run `sql/06_seed.sql` |
 | `reset` | `apply` + `seed` |
 | `psql` | interactive shell; extra args pass through |
+| `redis` / `mongo` | `redis-cli` and `mongosh` shells |
 | `down` / `nuke` | stop containers / stop and delete volumes |
 
 `psql` runs inside the container, so no local client is needed and client/server
@@ -67,7 +69,10 @@ versions cannot drift.
 docker-compose.yml          postgres + redis + mongo
 scripts/db.sh               stack and migration wrapper
 scripts/demo_booking.py     end-to-end walkthrough of the booking layer
+scripts/demo_day3.py        walkthrough of the cache + feedback store
+scripts/backfill_feedback.py  gives the seeded reviews real Mongo documents
 docs/er-diagram.md          ER diagram + normalization argument
+docs/code-walkthrough.md    file-by-file explanation of the whole repo
 sql/
   01_extensions.sql         postgis, btree_gist, citext, pg_trgm
   02_tables.sql             3NF schema, constraints, exclusion constraint
@@ -83,16 +88,21 @@ app/
   models.py                 row -> dataclass mapping
   availability.py           the availability CTE
   reservations.py           book / cancel / get / list
-tests/                      38 tests incl. deterministic race proofs
+  cache.py                  Redis availability cache (Day 3)
+  feedback.py               MongoDB feedback store (Day 3)
+tests/                      69 tests incl. deterministic race proofs
 ```
 
 ## Python layer (Day 2)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest        # 38 tests
+.venv/bin/python -m pytest        # 69 tests
 .venv/bin/python scripts/demo_booking.py
 ```
+
+The Redis and MongoDB tests skip themselves if those services are down, so the
+Day 1–2 suite still runs against Postgres alone.
 
 ```python
 from app import Database, book_reservation
@@ -158,6 +168,118 @@ are discarded rather than recycled.
 
 ---
 
+## Redis + MongoDB (Day 3)
+
+```bash
+.venv/bin/python scripts/backfill_feedback.py   # seeded reviews -> Mongo documents
+.venv/bin/python scripts/demo_day3.py           # cache + feedback walkthrough
+```
+
+Both are opt-in at the call site. Nothing in the Day 1–2 core imports `redis` or
+`pymongo`, so the booking layer still runs with only psycopg2 installed:
+
+```python
+from app import Database, book_reservation, find_available_tables
+from app.cache import AvailabilityCache
+from app.feedback import FeedbackStore, add_review
+
+with Database.from_settings() as db, AvailabilityCache.from_settings() as cache:
+    tables = find_available_tables(db, restaurant_id=1, starts_at=slot,
+                                   party_size=4, cache=cache)   # read-through
+    book_reservation(db, restaurant_id=1, customer_id=7, starts_at=slot,
+                     party_size=4, cache=cache)                 # invalidates
+```
+
+### The cache changes latency, not semantics
+
+Availability was *already* advisory — another transaction may take the table
+between the listing and the booking, which is why `book_reservation` re-derives
+candidates inside its `INSERT` and lets the exclusion constraint arbitrate. A
+cached answer is therefore no less trustworthy than a fresh one, and
+`book_reservation` never reads the cache at all. A cache that could veto a
+booking would be a cache that can corrupt the schedule;
+`test_booking_never_reads_the_cache` poisons Redis with "nothing is free" and
+asserts the booking still succeeds.
+
+### Invalidation is a generation counter
+
+The obvious design — `DEL avail:*:<restaurant>:*` on every write — needs a `SCAN`
+and a variable number of deletes. Instead each restaurant carries a counter that
+is baked into every entry key:
+
+```
+avail:v1:gen:<restaurant_id>          ->  integer, INCR on every write
+avail:v1:<restaurant_id>:g<N>:<slot>:<party>:<zone>:<duration>  ->  the listing
+```
+
+One `INCR` makes an entire generation unreachable in O(1). Superseded entries are
+never deleted; they expire. Two ordering rules make it correct, and both are easy
+to get backwards:
+
+1. **Read the generation before querying Postgres.** Reading it afterwards lets a
+   write that lands mid-query bump the counter first, so the stale rows get
+   stored under the *new* generation — exactly where the next reader looks.
+2. **Invalidate strictly after the transaction commits.** Bumping early lets a
+   concurrent reader pick up the new generation, query Postgres, still see
+   pre-commit state, and cache it under a generation nothing will supersede.
+
+`CACHE_TTL_SECONDS` (default 60) is not the invalidation mechanism — it is the
+backstop for writes that never go through this package at all, like a `psql`
+session or a cron job.
+
+An outage degrades to a miss. Redis holds a rebuildable copy of something
+Postgres already knows, so `redis.RedisError` is caught, counted, and reported as
+"not cached"; socket timeouts are short, because a cache that blocks longer than
+the query it replaces is worse than no cache.
+
+### MongoDB holds the prose, Postgres holds the numbers
+
+Ratings stay in `reviews` because `v_restaurant_ratings` aggregates over them.
+Long-form text goes to `restaurant_feedback.reviews`, and `reviews.body_ref` is
+the only link. The document denormalizes `restaurant_id` — which
+`docs/er-diagram.md` argues *against* doing inside Postgres — because the
+reasoning differs across stores: within one relational store a derived column can
+contradict its source with no constraint to catch it, whereas MongoDB cannot
+enforce a foreign key into Postgres under any schema, so nothing is lost that was
+being relied on. Postgres wins every disagreement.
+
+A review is written across two stores that share no transaction, so the order is
+forced by what each failure leaves behind:
+
+1. Postgres: upsert the ratings row (`body_ref` still NULL)
+2. MongoDB: upsert the document, keyed on `reservation_id`
+3. Postgres: set `body_ref`
+
+**The pointer is written last because the pointer is the commitment.** A crash
+between 1 and 2 leaves ratings without prose — a legal state. Between 2 and 3 it
+leaves an unlinked document, which `reconcile()` detects and re-links, and which
+re-running `add_review` heals on its own since both upserts are idempotent. The
+reverse order would produce a dangling pointer, where a reader cannot tell "not
+written yet" from "lost".
+
+Unlike the cache, this layer does **not** degrade silently: MongoDB holds the
+only copy of the prose, so `pymongo` errors propagate.
+
+### `reconcile()` stands in for the missing constraint
+
+No database can enforce a foreign key into MongoDB, so the invariant has to be
+checked by running something. It reports three kinds of divergence — `dangling`
+(Postgres points at a missing document), `unlinked` (document exists, pointer is
+NULL), and `orphaned` (document whose review row is gone). Orphans are
+**reported, never deleted**: automatically destroying a diner's prose because a
+pointer went missing is not a repair, and it is not reversible.
+
+Pass `reservation_ids=` to scope it. Unscoped, `repair=True` is a whole-database
+write that clears every `body_ref` it cannot resolve — correct only when `store`
+is genuinely the collection those reviews point into.
+
+> `sql/06_seed.sql` fabricates `body_ref` with `substr(md5(...), 1, 24)` — valid
+> ObjectId *format* pointing at nothing, so a fresh seed leaves ~2,650 dangling
+> references. `scripts/backfill_feedback.py` writes the documents and repoints
+> them; `reconcile` reports zero afterwards.
+
+---
+
 ## Schema at a glance
 
 Eight relations: `cities`, `restaurants`, `restaurant_tables`, `cuisines`,
@@ -212,8 +334,9 @@ Spans 45 days past to 14 days future across three slots per table per day, so
 - [x] **Day 1** — schema design + database setup
 - [x] **Day 2** — psycopg2 connection pooling; atomic `book_reservation()`
       handling `23P01` as "slot taken"; parameterized queries throughout
-- [ ] **Day 3** — Redis availability cache with invalidation on write; MongoDB
-      feedback documents linked by `reviews.body_ref`
+- [x] **Day 3** — Redis availability cache with generation-counter invalidation
+      on write; MongoDB feedback documents linked by `reviews.body_ref`, with
+      `reconcile()` for the cross-store invariant no constraint can express
 - [ ] **Day 4** — per-city `RANK()`, availability CTE, `EXPLAIN ANALYZE` tuning,
       GiST location search
 

@@ -6,6 +6,8 @@
 #   ./scripts/db.sh seed    run sql/06_seed.sql
 #   ./scripts/db.sh reset   apply + seed
 #   ./scripts/db.sh psql    interactive shell (extra args are passed through)
+#   ./scripts/db.sh redis   redis-cli shell
+#   ./scripts/db.sh mongo   mongosh shell (restaurant_feedback)
 #   ./scripts/db.sh down    stop containers, keep volumes
 #   ./scripts/db.sh nuke    stop containers and delete volumes
 #
@@ -70,7 +72,12 @@ case "${1:-}" in
     seed)  cmd_seed ;;
     reset) cmd_apply; cmd_seed ;;
     psql)  shift; compose exec postgres psql -U "$DB_USER" -d "$DB_NAME" "$@" ;;
+    redis) shift; compose exec redis redis-cli "$@" ;;
+    mongo) shift; compose exec mongo mongosh \
+               -u "$DB_USER" -p rr_password --authenticationDatabase admin \
+               restaurant_feedback "$@" ;;
     down)  compose down ;;
     nuke)  compose down -v ;;
-    *)     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    # Prints this file's own header block, so help can never drift from docs.
+    *)     sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

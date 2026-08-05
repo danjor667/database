@@ -22,6 +22,8 @@ class Settings:
     booking_max_attempts: int
     redis_url: str
     mongo_url: str
+    cache_ttl_seconds: int
+    mongo_database: str
 
 
 def _int_env(name: str, default: int) -> int:
@@ -55,4 +57,11 @@ def load_settings() -> Settings:
             "mongodb://rr_app:rr_password@localhost:27017/"
             "restaurant_feedback?authSource=admin",
         ),
+        # Availability is invalidated explicitly on every write, so the TTL is a
+        # backstop for the one case invalidation cannot cover: a reservation that
+        # reaches Postgres without going through this package (psql, a cron job,
+        # another service). Keep it short enough that such a write cannot go
+        # unnoticed for long, long enough that the cache still absorbs a burst.
+        cache_ttl_seconds=_int_env("CACHE_TTL_SECONDS", 60),
+        mongo_database=os.environ.get("MONGO_DATABASE", "restaurant_feedback"),
     )

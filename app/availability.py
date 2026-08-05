@@ -13,12 +13,14 @@ does not trust it and lets the exclusion constraint arbitrate.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Sequence
-# from collections.abc import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from .db import Database
 from .errors import InvalidBookingRequest
 from .models import AvailableTable
+
+if TYPE_CHECKING:  # avoids importing redis at runtime for callers with no cache
+    from .cache import AvailabilityCache
 
 # The requested window is derived inside SQL from the restaurant's own
 # slot_minutes, so a caller cannot accidentally book a 90-minute slot at a
@@ -113,11 +115,17 @@ def find_available_tables(
     party_size: int,
     zone: str | None = None,
     duration_minutes: int | None = None,
+    cache: "AvailabilityCache | None" = None,
 ) -> Sequence[AvailableTable]:
     """List tables that can seat `party_size` at `starts_at`, smallest first.
 
     Ordering by seats ascending is a capacity policy: filling a party of two into
     a two-top keeps the six-tops free for parties that need them.
+
+    Passing `cache` serves repeat lookups from Redis. It changes latency, not
+    semantics: the result was already advisory (another transaction may take the
+    table before the caller acts on it), so a cached answer is no less trustworthy
+    than a fresh one. `book_reservation` never reads this cache.
     """
     validate_request(starts_at, party_size)
     params = build_params(
@@ -128,6 +136,36 @@ def find_available_tables(
         duration_minutes=duration_minutes,
     )
 
+    # Read the generation *before* querying Postgres. Reading it afterwards would
+    # let a write that lands mid-query bump the counter first, and this stale
+    # result would then be stored under the new generation, where the next reader
+    # would find it. See app/cache.py.
+    generation = cache.generation(restaurant_id) if cache is not None else None
+
+    if cache is not None and generation is not None:
+        cached = cache.get(
+            restaurant_id,
+            generation,
+            starts_at=starts_at,
+            party_size=party_size,
+            zone=zone,
+            duration_minutes=duration_minutes,
+        )
+        if cached is not None:
+            return cached
+
     with db.transaction(readonly=True) as cur:
         cur.execute(AVAILABILITY_SQL, params)
-        return [AvailableTable.from_row(row) for row in cur.fetchall()]
+        tables = [AvailableTable.from_row(row) for row in cur.fetchall()]
+
+    if cache is not None and generation is not None:
+        cache.set(
+            restaurant_id,
+            generation,
+            tables,
+            starts_at=starts_at,
+            party_size=party_size,
+            zone=zone,
+            duration_minutes=duration_minutes,
+        )
+    return tables

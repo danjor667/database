@@ -54,3 +54,16 @@ class BookingConflict(BookingError):
     Signals contention, not invalid input: the same request may well succeed if
     retried later.
     """
+
+
+class ReviewNotFound(BookingError):
+    """No review row in Postgres for the given reservation."""
+
+
+class FeedbackNotFound(BookingError):
+    """No feedback document in MongoDB for the given reference.
+
+    Distinct from a review with `body_ref IS NULL`, which simply means the diner
+    left ratings without prose. This one means a pointer exists but resolves to
+    nothing — a genuine cross-store inconsistency, which `reconcile()` reports.
+    """

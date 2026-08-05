@@ -35,6 +35,44 @@ class AvailableTable:
 
 
 @dataclass(frozen=True)
+class Feedback:
+    """A long-form feedback document from MongoDB.
+
+    `feedback_id` is the stringified ObjectId — the same value Postgres stores in
+    `reviews.body_ref`. It is kept as `str` rather than `bson.ObjectId` so that
+    callers of this package never need bson imported.
+    """
+
+    feedback_id: str
+    reservation_id: int
+    restaurant_id: int
+    customer_id: int
+    rating: int
+    body: str
+    title: str | None = None
+    tags: tuple[str, ...] = ()
+    language: str = "en"
+    visited_at: datetime | None = None
+    created_at: datetime | None = None
+
+    @classmethod
+    def from_document(cls, doc: Mapping[str, Any]) -> "Feedback":
+        return cls(
+            feedback_id=str(doc["_id"]),
+            reservation_id=doc["reservation_id"],
+            restaurant_id=doc["restaurant_id"],
+            customer_id=doc["customer_id"],
+            rating=doc["rating"],
+            body=doc["body"],
+            title=doc.get("title"),
+            tags=tuple(doc.get("tags") or ()),
+            language=doc.get("language", "en"),
+            visited_at=doc.get("visited_at"),
+            created_at=doc.get("created_at"),
+        )
+
+
+@dataclass(frozen=True)
 class Reservation:
     reservation_id: int
     table_id: int

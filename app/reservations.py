@@ -45,8 +45,12 @@ import logging
 import random
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from psycopg2 import errors as pg_errors
+
+if TYPE_CHECKING:  # avoids importing redis at runtime for callers with no cache
+    from .cache import AvailabilityCache
 
 from .availability import _FREE_TABLES, _REQUEST_CTE, build_params, validate_request
 from .config import load_settings
@@ -111,13 +115,20 @@ RETURNING reservation_id, table_id, customer_id, during, party_size,
           status, special_requests
 """
 
+# RETURNING can only see the modified row, but cache invalidation needs the
+# restaurant. Wrapping the UPDATE in a CTE lets one round-trip produce both.
 _CANCEL_SQL = """
-UPDATE reservations
-   SET status = 'cancelled'
- WHERE reservation_id = %(reservation_id)s
-   AND status NOT IN ('completed', 'cancelled')
-RETURNING reservation_id, table_id, customer_id, during, party_size,
-          status, special_requests
+WITH updated AS (
+    UPDATE reservations
+       SET status = 'cancelled'
+     WHERE reservation_id = %(reservation_id)s
+       AND status NOT IN ('completed', 'cancelled')
+    RETURNING reservation_id, table_id, customer_id, during, party_size,
+              status, special_requests
+)
+SELECT u.*, rt.restaurant_id
+  FROM updated u
+  JOIN restaurant_tables rt USING (table_id)
 """
 
 _GET_SQL = """
@@ -150,6 +161,7 @@ def book_reservation(
     special_requests: str | None = None,
     status: str = "confirmed",
     max_attempts: int | None = None,
+    cache: "AvailabilityCache | None" = None,
 ) -> Reservation:
     """Book the smallest suitable free table, atomically.
 
@@ -162,6 +174,8 @@ def book_reservation(
         zone: optional 'indoor' | 'patio' | 'bar' | 'private' preference.
         table_id: pin a specific table instead of letting the query choose.
         max_attempts: contention budget; defaults to BOOKING_MAX_ATTEMPTS.
+        cache: if given, its availability entries for this restaurant are
+            invalidated once the booking commits.
 
     Raises:
         InvalidBookingRequest: naive `starts_at`, or `party_size` < 1.
@@ -197,6 +211,12 @@ def book_reservation(
                 row = cur.fetchone()
 
             if row is not None:
+                # Strictly after the commit above. Bumping the generation while
+                # the transaction was still open would let a concurrent reader
+                # cache pre-commit availability under the new generation, where
+                # nothing would supersede it. See app/cache.py.
+                if cache is not None:
+                    cache.invalidate(restaurant_id)
                 return Reservation.from_row(row)
 
             # Zero rows inserted: the candidate subquery found nothing. That is
@@ -318,21 +338,33 @@ def _raise_unavailable(db: Database, params: dict[str, object]) -> None:
     )
 
 
-def cancel_reservation(db: Database, reservation_id: int) -> Reservation:
+def cancel_reservation(
+    db: Database, reservation_id: int, *, cache: "AvailabilityCache | None" = None
+) -> Reservation:
     """Cancel a reservation, releasing its slot for rebooking.
 
     Cancelling sets a status rather than deleting the row: the partial exclusion
     constraint stops counting it, so the table frees up while history survives.
+
+    A cancellation *adds* availability, so failing to invalidate here would hide
+    a newly free table until the entry's TTL expired.
     """
+    existing = None
     with db.transaction() as cur:
         cur.execute(_CANCEL_SQL, {"reservation_id": reservation_id})
         row = cur.fetchone()
-        if row is not None:
-            return Reservation.from_row(row)
+        if row is None:
+            # Nothing updated: either it does not exist, or it is already terminal.
+            cur.execute(_GET_SQL, {"reservation_id": reservation_id})
+            existing = cur.fetchone()
 
-        # Nothing updated: either it does not exist, or it is already terminal.
-        cur.execute(_GET_SQL, {"reservation_id": reservation_id})
-        existing = cur.fetchone()
+    # Outside the block, so the transaction has committed — invalidating earlier
+    # would let a concurrent reader cache pre-commit availability under the new
+    # generation. See app/cache.py.
+    if row is not None:
+        if cache is not None:
+            cache.invalidate(row["restaurant_id"])
+        return Reservation.from_row(row)
 
     if existing is None:
         raise ReservationNotFound(f"reservation_id {reservation_id} does not exist")
