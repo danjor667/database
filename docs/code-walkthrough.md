@@ -747,33 +747,69 @@ collapses the duplicate column in the output.
 **`v_restaurant_reviews`** — each review resolved to its restaurant and reviewer,
 built by joining `reviews` to the view above.
 
-**`v_restaurant_ratings`** — the rollup that Day 4 will rank over:
+**`v_restaurant_ratings`** — the rollup the ranking sits on. This one was
+**rewritten during Day 4**, and both the before and after are worth studying.
+
+The original joined the whole chain and aggregated at the end:
 
 ```sql
-count(rv.review_id)               AS review_count,
-round(avg(rv.rating)::numeric, 2) AS avg_rating,
-…
-max(upper(res.during))            AS last_reviewed_visit
 FROM restaurants r
 JOIN cities ci USING (city_id)
 LEFT JOIN restaurant_tables rt  ON …
 LEFT JOIN reservations      res ON …
 LEFT JOIN reviews           rv  ON …
 WHERE r.is_active
-GROUP BY r.restaurant_id, r.name, ci.city_id, ci.name, ci.region, r.price_tier
+GROUP BY r.restaurant_id, …
 ```
 
-Two details to learn from:
+It was replaced because it was **both slower and wrong**, from the same root
+cause:
 
-- The joins down to `reviews` are **LEFT** so that a restaurant with no reviews
-  survives with `review_count = 0` rather than vanishing from listings. An inner
-  join here is a classic reporting bug.
-- `count(rv.review_id)` counts *non-null* values, so it correctly returns 0 for
-  those restaurants — whereas `count(*)` would return 1 (counting the row
-  produced by the outer join).
+- **Slower.** It fans out to one row per *reservation* (9,517) to compute an
+  aggregate over *reviews* (2,648). Measured: 5.5 ms → 2.5 ms after the rewrite.
+- **Wrong.** With `reviews` LEFT JOINed last, reservations carrying no review
+  still contributed their `during` to `max()`. So `last_reviewed_visit` reported
+  the last **reservation** — usually a future booking, two weeks off. The column
+  name stated the opposite of what it computed.
+
+The current shape aggregates reviews first, then joins the eight-row result:
+
+```sql
+WITH per_restaurant AS (
+    SELECT rt.restaurant_id, count(*) AS review_count, avg(rv.rating) AS avg_rating,
+           max(upper(res.during)) AS last_reviewed_visit
+      FROM reviews rv
+      JOIN reservations      res USING (reservation_id)
+      JOIN restaurant_tables rt  USING (table_id)
+     GROUP BY rt.restaurant_id
+)
+SELECT …, coalesce(pr.review_count, 0) AS review_count, …
+  FROM restaurants r
+  JOIN cities ci USING (city_id)
+  LEFT JOIN per_restaurant pr USING (restaurant_id)
+ WHERE r.is_active
+```
+
+Starting from `reviews` makes the bug unrepresentable rather than merely fixed —
+there is no longer any row in the aggregate that is not a review.
+
+Details worth carrying away:
+
+- The **outer** LEFT JOIN is still required, so a restaurant with no reviews
+  survives with `review_count = 0` instead of vanishing. An inner join here is a
+  classic reporting bug.
+- `coalesce(pr.review_count, 0)` — "no reviews" is a count of zero, not a NULL.
+  (In the original, `count(rv.review_id)` served the same purpose: counting a
+  *column* skips NULLs, whereas `count(*)` would have returned 1 for the row the
+  outer join manufactured.)
 - `avg()` on an `integer` returns `numeric` already, but the explicit
-  `::numeric` cast before `round(…, 2)` is needed because `round(double precision, int)`
-  does not exist in Postgres — a genuinely common error.
+  `::numeric` cast before `round(…, 2)` is needed because
+  `round(double precision, int)` does not exist in Postgres — a genuinely common
+  error.
+- **Generalisable lesson:** joining down to the thing you are aggregating and
+  grouping at the end both carries too much data *and* silently widens what the
+  aggregate sees. The performance bug and the correctness bug were the same
+  mistake.
 
 ### `06_seed.sql` — reproducible demo data
 
@@ -881,6 +917,78 @@ fabricates a 24-hex-character string that satisfies the ObjectId format CHECK.
 The file ends with `ANALYZE;` and a `UNION ALL` row-count summary so you can see
 what loaded.
 
+### `07_analytics.sql` — window-function read models (Day 4)
+
+Applied after `05_views.sql`; the number only reflects apply order, and `06`
+being the seed rather than schema is an existing quirk of the numbering.
+`SCHEMA_FILES` in `scripts/db.sh` lists `07` explicitly.
+
+**`v_restaurant_rankings`** — the assignment's headline query, "rank restaurants
+by average review score per city".
+
+```sql
+RANK()       OVER w  AS city_rank,
+DENSE_RANK() OVER w  AS city_dense_rank,
+ROW_NUMBER() OVER (PARTITION BY ra.city_id
+                   ORDER BY ra.avg_rating DESC NULLS LAST,
+                            ra.review_count DESC, ra.restaurant_id) AS city_row_number
+…
+WINDOW w AS (PARTITION BY ra.city_id ORDER BY ra.avg_rating DESC NULLS LAST)
+```
+
+The `WINDOW` clause names a window definition once and reuses it, instead of
+repeating the `OVER (…)` on every function — worth knowing, since these clauses
+get long.
+
+**`PARTITION BY` is what makes per-group top-N possible.** `WHERE city_rank <= 3`
+gives each city's top three; `ORDER BY avg_rating DESC LIMIT 3` would give three
+rows in total. That distinction is the single most useful thing window functions
+buy you here.
+
+**The three ranking functions differ only on ties:**
+
+| avg_rating | RANK | DENSE_RANK | ROW_NUMBER |
+|---|---|---|---|
+| 4.40 | 1 | 1 | 1 |
+| 4.20 | 2 | 2 | 2 |
+| 4.20 | 2 | 2 | 3 |
+| 4.10 | **4** | **3** | 4 |
+
+RANK is the honest default for a leaderboard — two restaurants tied for 2nd means
+nobody is 3rd. ROW_NUMBER suits pagination, where an arbitrary but *stable* total
+order is needed; note its `ORDER BY` carries explicit tiebreaks, because without
+them the same query can number rows differently between runs.
+
+No two restaurants in a city share a rounded rating in the seed, so all three
+agree there. `v_slot_demand` *does* contain real ties, which is where the
+difference is observable on shipped data.
+
+**`NULLS LAST` is load-bearing.** Postgres sorts NULLs *first* under `DESC` by
+default, so without it every unrated restaurant would head its city's ranking.
+
+**Window aggregates alongside detail rows** — this is the other thing a window
+function does that `GROUP BY` cannot:
+
+```sql
+round(avg(ra.avg_rating) OVER (PARTITION BY ra.city_id), 2) AS city_avg_rating
+```
+
+The city's mean appears on every row *without* collapsing the rows. A `GROUP BY`
+would force a self-join to get the same result.
+
+**`v_slot_demand`** — booking volume per (restaurant, weekday, hour), ranked
+within each restaurant. It demonstrates a subtlety: a window function may be
+applied *over the result of an aggregate*, so
+
+```sql
+round(100.0 * count(*) / sum(count(*)) OVER (PARTITION BY rt.restaurant_id), 1)
+```
+
+is legal and needs no subquery — `count(*)` is evaluated by the GROUP BY, then
+`sum(...) OVER` runs across the grouped rows. Only blocking statuses count as
+demand, matching the exclusion constraint and the availability CTE; all three
+lists must agree.
+
 ### `99_checks.sql` — a self-verifying invariant suite
 
 This file is the schema's own test suite, and it is a genuinely nice pattern.
@@ -952,9 +1060,10 @@ docker compose exec -T postgres \
 
 ## 4. The Python layer, file by file
 
-Eight modules in `app/`, layered so that each depends only on the ones below it:
+Nine modules in `app/`, layered so that each depends only on the ones below it:
 
 ```
+analytics.py      ← rankings, location search            (Day 4)
 feedback.py       ← MongoDB prose + cross-store writes   (Day 3)
 cache.py          ← Redis availability cache             (Day 3)
      ↓
@@ -1583,6 +1692,64 @@ passed. `test_scoped_repair_leaves_other_reviews_alone` is the regression test.
 `reconcile` loads both key sets into memory — fine at this scale (thousands of
 reviews), and the docstring names the point at which it stops being fine.
 
+### `app/analytics.py` — rankings and location search (Day 4)
+
+Parameterized queries over the Day 4 views, plus the geospatial searches. Like
+`cache` and `feedback` it is imported directly rather than re-exported.
+
+**The work stays in SQL.** Ranking, percentages and distances are computed by the
+database and returned finished. Pulling rows into Python to rank them there would
+move the work to the slowest machine in the system and discard the index that
+made it cheap.
+
+**`ST_DWithin` vs `ST_Distance` is the important lesson in this file.** These
+return identical answers:
+
+```sql
+ST_DWithin(location, point, 5000)          -- indexable
+ST_Distance(location, point) <= 5000       -- not indexable
+```
+
+Measured on 50,000 points: **0.09 ms versus 64 ms**. The planner cannot bound the
+output of a function with a GiST index, so the second form computes a spheroid
+distance for every row in the table. No index fixes it — the predicate has to be
+written the other way. Distance is still *selected* for display, which is cheap
+once the index has narrowed the candidates.
+
+**KNN ordering** (`nearest_restaurants`) uses the `<->` operator:
+
+```sql
+ORDER BY r.location <-> search.point LIMIT 5
+```
+
+Given a GiST index, Postgres walks the tree in distance order and stops after
+`LIMIT` rows. `ORDER BY ST_Distance(...) LIMIT 5` would compute every distance
+and then sort. Prefer this over a huge radius, which must find every match first.
+
+**`find_nearby_available` is the payoff query** — geography narrows the
+candidates, the ratings rollup ranks them, and the Day 2 availability anti-join
+decides which can actually seat the party, each clause served by the index built
+for it. It returns plain dicts rather than a dataclass because the shape is a
+report, not a domain entity. The result is advisory in exactly the way
+`find_available_tables` is: the exclusion constraint remains the only arbiter.
+
+**`rating_trend` uses `LAG`** to reach the previous row of the window, which is
+how a month-over-month delta is expressed without a self-join. The first month
+has no predecessor, so `delta` is NULL there rather than being silently treated
+as zero. It also demonstrates a moving frame:
+
+```sql
+AVG(m.avg_rating) OVER (PARTITION BY m.restaurant_id ORDER BY m.month
+                        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+```
+
+`ROWS BETWEEN …` is the frame clause — the window's *ordering* decides row
+sequence, the frame decides how much of it each row sees.
+
+One small note in `models.py`: `_as_float` converts the `Decimal` that `numeric`
+columns arrive as into plain floats, so callers do not have to import `decimal`
+to compare a rating.
+
 #### `app/__init__.py`
 
 Re-exports the public surface with an explicit `__all__`, so callers write
@@ -1593,7 +1760,7 @@ Re-exports the public surface with an explicit `__all__`, so callers write
 
 ## 5. The tests
 
-69 tests across five files, plus shared fixtures. They are **not hermetic** —
+89 tests across six files, plus shared fixtures. They are **not hermetic** —
 they run against the seeded development database, as `pytest.ini` states.
 `./scripts/db.sh reset` restores a known state.
 
@@ -1828,6 +1995,32 @@ The `reconcile` tests assert **membership**, never totals: a freshly seeded
 database has ~2,650 dangling refs until `backfill_feedback.py` runs, so any
 count-based assertion would be coupled to whether that script had been run.
 
+### `tests/test_analytics.py` — 20 tests
+
+These assert on *semantics the SQL is easy to get subtly wrong*, not on the
+seed's particular numbers — which would break the moment the dataset changed.
+
+| Test | Proves |
+|---|---|
+| `test_max_rank_is_per_city_not_a_global_limit` | the point of `PARTITION BY`: one winner per city, not one overall |
+| `test_every_city_ranking_starts_at_one` | each partition restarts numbering |
+| `test_city_aggregate_columns_are_consistent` | the window aggregates agree with the rows they cover, and shares sum to 100 |
+| `test_unrated_restaurant_survives_and_sorts_last` | LEFT JOIN + `NULLS LAST` together |
+| `test_rank_dense_rank_and_row_number_differ_only_on_ties` | the documented tie table, against a literal `VALUES` list |
+| `test_tied_slots_share_a_rank` | the same behaviour on **real** data, via `v_slot_demand` |
+| `test_last_reviewed_visit_counts_only_reviewed_visits` | regression for the rollup bug |
+| `test_distances_are_metres_not_degrees` | `geography`, not planar `geometry` |
+| `test_nearest_returns_closest_first_without_a_radius` | KNN and radius search agree on what is closest |
+| `test_nearby_available_drops_a_fully_booked_restaurant` | the combined query's availability half really filters |
+| `test_rating_trend_lag_is_the_previous_month` | `LAG` is the previous row, and NULL on the first |
+
+Two are worth singling out. The tie tests come in a pair on purpose: one pins the
+semantics against a literal so it cannot be affected by data, the other proves
+the same behaviour occurs in the shipped dataset. And
+`test_unrated_restaurant_survives_and_sorts_last` uses a fixture that creates and
+deletes a review-less restaurant, because the seed has none — the case only
+exists if you build it.
+
 ---
 
 ## 6. The demo and utility scripts
@@ -1897,6 +2090,39 @@ It re-reads the authoritative `_id`s after the bulk write rather than trusting
 the generated ones, because a document that already existed keeps its original
 id, and then verifies itself by printing a `reconcile` report.
 
+### `scripts/demo_analytics.py`
+
+Seven sections covering the Day 4 queries: per-city ranking, per-city top-N,
+radius search, KNN, the combined nearby-and-available query, busiest slots, and
+the rating trend.
+
+### `scripts/explain.py`
+
+The measurement harness, and the most methodologically interesting script here.
+Its design choices are the lesson:
+
+- **Median of N runs, first discarded.** A single run measures cache state as
+  much as the query. The mean would be dragged by one autovacuum; the minimum
+  would flatter.
+- **Postgres's own `Execution Time`**, so the number excludes client round trip
+  and row mapping — it measures the database, not psycopg2.
+- **Planning time as its own column.** For the availability query, planning
+  (0.218 ms) costs *more* than execution (0.082 ms). That is invisible unless you
+  look, and it is the most actionable finding in `docs/performance.md`.
+- **Buffers reported alongside timings.** Buffer counts are the stabler signal —
+  they count pages touched and barely move between runs, whereas laptop timings
+  swing with whatever else is running.
+- **A/B by `SET LOCAL enable_indexscan = off`** rather than dropping the index.
+  It forces the planner to cost the alternative on the same data in the same
+  session, with no schema change to undo.
+- **`--scale` builds a 50,000-row table** to find where an index starts to pay,
+  because the 8-row seed never will. `setseed(0.17)` makes the generated points —
+  and therefore the measurement — reproducible.
+
+That last point generalises: an index that looks useless on a development
+dataset can be the difference between 0.1 ms and 100 ms in production. The only
+way to know is to measure at a representative size.
+
 ---
 
 ## 7. Postgres feature glossary
@@ -1957,6 +2183,25 @@ Quick reference for everything the project uses.
 | `$meta: "textScore"` | relevance score for projection and sorting | `search()` ordering |
 | `bulk_write` | many operations in one round trip | backfill |
 | `ObjectId()` | 12-byte id, generatable client-side | backfill's two-phase link |
+
+**Window functions and analytics (Day 4):**
+
+| Feature | What it does | Where |
+|---|---|---|
+| `RANK() OVER (PARTITION BY …)` | ranking restarted per group; ties share, then skip | `v_restaurant_rankings` |
+| `DENSE_RANK()` | as RANK, but does not skip after a tie | same |
+| `ROW_NUMBER()` | forced distinct sequence; needs explicit tiebreaks | same |
+| `PERCENT_RANK()` | relative standing, 0.0 to 1.0 | `city_percentile` |
+| `LAG()` | reaches the previous row — deltas without a self-join | `rating_trend` |
+| `avg() OVER (PARTITION BY …)` | aggregate *alongside* detail rows, not collapsing them | `city_avg_rating` |
+| `sum(count(*)) OVER …` | window applied over an aggregate's result | `v_slot_demand` |
+| `ROWS BETWEEN n PRECEDING AND CURRENT ROW` | moving frame | 3-month rolling average |
+| `WINDOW w AS (…)` | name a window once, reuse it | both Day 4 views |
+| `NULLS LAST` | NULLs sort first under `DESC` by default | ranking order |
+| `ST_DWithin` | indexable "within N metres" | radius search |
+| `<->` | KNN distance operator; index walked in distance order | `nearest_restaurants` |
+| `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` | real timings, pages touched, machine-readable | `scripts/explain.py` |
+| `SET LOCAL enable_indexscan = off` | force the planner to cost an alternative | A/B probes |
 
 ---
 

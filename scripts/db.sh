@@ -2,7 +2,7 @@
 # Convenience wrapper around the Docker stack and the SQL migrations.
 #
 #   ./scripts/db.sh up      start postgres + redis + mongo, wait for health
-#   ./scripts/db.sh apply   run sql/01..05 (schema, triggers, indexes, views)
+#   ./scripts/db.sh apply   run sql/01..05 + 07 (schema, triggers, indexes, views)
 #   ./scripts/db.sh seed    run sql/06_seed.sql
 #   ./scripts/db.sh reset   apply + seed
 #   ./scripts/db.sh psql    interactive shell (extra args are passed through)
@@ -20,7 +20,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 DB_USER=rr_app
 DB_NAME=restaurant_reservations
-SCHEMA_FILES=(01_extensions 02_tables 03_triggers 04_indexes 05_views)
+# 06 is the seed, not schema, so it is applied separately by `seed`.
+SCHEMA_FILES=(01_extensions 02_tables 03_triggers 04_indexes 05_views 07_analytics)
 
 compose() { docker compose "$@"; }
 

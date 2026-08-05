@@ -35,6 +35,73 @@ class AvailableTable:
 
 
 @dataclass(frozen=True)
+class RestaurantRanking:
+    """One row of the per-city leaderboard (`v_restaurant_rankings`)."""
+
+    restaurant_id: int
+    restaurant_name: str
+    city: str
+    region: str
+    price_tier: int
+    review_count: int
+    avg_rating: float | None
+    city_rank: int
+    city_dense_rank: int
+    city_restaurant_count: int
+    city_avg_rating: float | None
+    vs_city_avg: float | None
+    pct_of_city_reviews: float | None
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "RestaurantRanking":
+        return cls(
+            restaurant_id=row["restaurant_id"],
+            restaurant_name=row["restaurant_name"],
+            city=row["city"],
+            region=row["region"],
+            price_tier=row["price_tier"],
+            review_count=row["review_count"],
+            avg_rating=_as_float(row["avg_rating"]),
+            city_rank=row["city_rank"],
+            city_dense_rank=row["city_dense_rank"],
+            city_restaurant_count=row["city_restaurant_count"],
+            city_avg_rating=_as_float(row["city_avg_rating"]),
+            vs_city_avg=_as_float(row["vs_city_avg"]),
+            pct_of_city_reviews=_as_float(row["pct_of_city_reviews"]),
+        )
+
+
+@dataclass(frozen=True)
+class NearbyRestaurant:
+    """A restaurant with its distance from a search point, in metres."""
+
+    restaurant_id: int
+    name: str
+    city: str
+    metres: float
+    price_tier: int
+    avg_rating: float | None
+    review_count: int
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "NearbyRestaurant":
+        return cls(
+            restaurant_id=row["restaurant_id"],
+            name=row["name"],
+            city=row["city"],
+            metres=_as_float(row["metres"]),
+            price_tier=row["price_tier"],
+            avg_rating=_as_float(row.get("avg_rating")),
+            review_count=row.get("review_count") or 0,
+        )
+
+
+def _as_float(value: Any) -> float | None:
+    """numeric columns arrive as Decimal; callers want plain floats."""
+    return None if value is None else float(value)
+
+
+@dataclass(frozen=True)
 class Feedback:
     """A long-form feedback document from MongoDB.
 

@@ -3,8 +3,8 @@
 Database Fundamentals lab. PostgreSQL for the transactional core, Redis for
 availability caching, MongoDB for long-form review prose.
 
-**Status:** Days 1–3 complete (schema, transactional booking, Redis + MongoDB).
-Day 4 pending.
+**Status:** complete. Schema, transactional booking, Redis + MongoDB, and the
+analytical queries with measured tuning.
 
 ---
 
@@ -51,7 +51,7 @@ postgresql://rr_app:rr_password@localhost:5433/restaurant_reservations
 | Command | Effect |
 |---|---|
 | `up` | start containers, wait for health |
-| `apply` | run `sql/01`–`05` (schema, triggers, indexes, views) |
+| `apply` | run `sql/01`–`05` + `07` (schema, triggers, indexes, views) |
 | `seed` | run `sql/06_seed.sql` |
 | `reset` | `apply` + `seed` |
 | `psql` | interactive shell; extra args pass through |
@@ -70,9 +70,12 @@ docker-compose.yml          postgres + redis + mongo
 scripts/db.sh               stack and migration wrapper
 scripts/demo_booking.py     end-to-end walkthrough of the booking layer
 scripts/demo_day3.py        walkthrough of the cache + feedback store
+scripts/demo_analytics.py   walkthrough of the Day 4 analytical queries
+scripts/explain.py          EXPLAIN ANALYZE harness + index crossover study
 scripts/backfill_feedback.py  gives the seeded reviews real Mongo documents
 docs/er-diagram.md          ER diagram + normalization argument
 docs/code-walkthrough.md    file-by-file explanation of the whole repo
+docs/performance.md         measured query timings and what changed
 sql/
   01_extensions.sql         postgis, btree_gist, citext, pg_trgm
   02_tables.sql             3NF schema, constraints, exclusion constraint
@@ -80,6 +83,7 @@ sql/
   04_indexes.sql            access paths, each justified by a query
   05_views.sql              read models for the analytics
   06_seed.sql               reproducible demo dataset (setseed)
+  07_analytics.sql          window-function read models (rankings, demand)
   99_checks.sql             self-verifying invariant suite
 app/
   config.py                 env-driven settings
@@ -90,14 +94,15 @@ app/
   reservations.py           book / cancel / get / list
   cache.py                  Redis availability cache (Day 3)
   feedback.py               MongoDB feedback store (Day 3)
-tests/                      69 tests incl. deterministic race proofs
+  analytics.py              rankings, location search (Day 4)
+tests/                      89 tests incl. deterministic race proofs
 ```
 
 ## Python layer (Day 2)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest        # 69 tests
+.venv/bin/python -m pytest        # 89 tests
 .venv/bin/python scripts/demo_booking.py
 ```
 
@@ -280,6 +285,71 @@ is genuinely the collection those reviews point into.
 
 ---
 
+## Analytics and tuning (Day 4)
+
+```bash
+.venv/bin/python scripts/demo_analytics.py      # the queries
+.venv/bin/python scripts/explain.py -n 15 --scale   # the measurements
+```
+
+Full write-up with numbers: [`docs/performance.md`](docs/performance.md).
+
+### Per-city ranking
+
+`v_restaurant_rankings` ranks restaurants within their city. `PARTITION BY` is
+what makes `max_rank=3` mean *each city's* top three — an `ORDER BY … LIMIT 3`
+would return three rows overall.
+
+```python
+from app.analytics import rank_restaurants_by_city
+rank_restaurants_by_city(db, max_rank=1)   # the best restaurant in every city
+```
+
+`RANK`, `DENSE_RANK` and `ROW_NUMBER` are all exposed because they answer
+different questions, and they differ only on ties: RANK gives tied rows the same
+number and then skips, DENSE_RANK does not skip, ROW_NUMBER forces a distinct
+sequence. No two restaurants in a city share a rounded rating in the seed, so
+they coincide there — but `v_slot_demand` does contain real ties, and the tests
+assert the behaviour on both.
+
+Restaurants with no reviews survive with `review_count = 0` and sort last:
+`NULLS LAST` is not the default for `DESC`, and without it every unrated
+restaurant would head its city.
+
+### Location search
+
+`geography(Point, 4326)` means distances are metres on a spheroid. Two forms,
+one indexable:
+
+```sql
+ST_DWithin(location, point, 5000)            -- 0.09 ms, GiST index scan
+ST_Distance(location, point) <= 5000         -- 64 ms, sequential scan
+```
+
+Identical answers, ~700× apart at 50k rows. The planner cannot bound a
+function's output with a GiST index, so the second form measures every row. For
+"nearest N", `ORDER BY location <-> point LIMIT 5` walks the index in distance
+order and stops early.
+
+### What the measurements changed
+
+- **The availability query needed no new index.** It is already served by the
+  GiST index Postgres builds to enforce the exclusion constraint — 16–18× faster
+  and 7× fewer buffers than a forced sequential scan. One structure, two jobs.
+- **The ratings rollup was rewritten and a bug fell out.** Aggregating reviews
+  first instead of joining the whole chain and grouping at the end is 2.1×
+  faster — and fixed `last_reviewed_visit`, which had been reporting the last
+  *reservation* (often a future booking) because un-reviewed rows still fed the
+  `max()`.
+- **Planning costs more than execution on the hot path** (0.218 ms vs 0.082 ms).
+  Recorded, not yet acted on; prepared statements are the fix but a generic plan
+  could regress this query, so it needs measuring first.
+- **Most indexes here do not pay at seed scale, and that is correct.** Eight
+  restaurants fit in two pages. `scripts/explain.py --scale` builds a 50,000-row
+  table to show where the crossover actually is.
+
+---
+
 ## Schema at a glance
 
 Eight relations: `cities`, `restaurants`, `restaurant_tables`, `cuisines`,
@@ -337,8 +407,10 @@ Spans 45 days past to 14 days future across three slots per table per day, so
 - [x] **Day 3** — Redis availability cache with generation-counter invalidation
       on write; MongoDB feedback documents linked by `reviews.body_ref`, with
       `reconcile()` for the cross-store invariant no constraint can express
-- [ ] **Day 4** — per-city `RANK()`, availability CTE, `EXPLAIN ANALYZE` tuning,
-      GiST location search
+- [x] **Day 4** — per-city `RANK()` and window functions over aggregates; GiST
+      radius and KNN location search; `EXPLAIN ANALYZE` harness with A/B plan
+      forcing and an index-crossover study. Findings in
+      [`docs/performance.md`](docs/performance.md)
 
 Open gaps from Day 1 are listed in
 [`docs/er-diagram.md` §6](docs/er-diagram.md#6-known-gaps) — most notably that
