@@ -30,9 +30,50 @@ Python or on MongoDB being reachable.
 Then:
 
 ```bash
-.venv/bin/python -m pytest                        # 89 tests
+.venv/bin/python -m pytest                        # 108 tests
 ./scripts/db.sh psql                              # interactive shell
 ```
+
+### Web GUI
+
+```bash
+.venv/bin/python -m app serve       # http://127.0.0.1:8000 — opens a browser tab
+```
+
+Book and cancel tables, browse the per-city leaderboard and location search,
+search review prose, and run the cross-store reconciler — all from one page.
+The server (`app/webapp.py`) is standard-library `http.server` exposing the
+same `app` functions the CLI calls; the frontend is a single static file
+(`app/static/index.html`). It binds loopback and has no authentication —
+it is a development GUI, not a deployment.
+
+### CLI
+
+Every layer is reachable from the terminal via `python -m app` — see
+`app/cli.py`. `--json` on any command emits machine-readable output; naive
+datetimes are read as UTC.
+
+```bash
+.venv/bin/python -m app restaurants                  # discover ids
+.venv/bin/python -m app availability 1 --at 2027-06-15T19:00 --party 4 --cache
+.venv/bin/python -m app book 1 --customer 7 --at 2027-06-15T19:00 \
+    --party 4 --zone patio --requests "window seat" --cache
+.venv/bin/python -m app cancel 9911 --cache
+.venv/bin/python -m app reservations 7               # a customer's bookings
+
+.venv/bin/python -m app rank --top 3                 # per-city leaderboard
+.venv/bin/python -m app nearby --lon -73.99 --lat 40.735 --radius 3000
+.venv/bin/python -m app slots --restaurant 1         # busiest (weekday, hour)
+
+.venv/bin/python -m app review add 42 --rating 5 --body "Superb tasting menu"
+.venv/bin/python -m app review search "service"      # Mongo full-text
+.venv/bin/python -m app reconcile                    # exits 1 on divergence
+```
+
+Domain errors print as one-line messages with exit 1. The layering mirrors the
+package: commands that never touch Redis or MongoDB run with only psycopg2
+installed, `--cache` degrades to uncached when Redis is down, and `reconcile`'s
+exit code makes it cron-able.
 
 Verify the schema's invariants (16 checks, runs in a rolled-back transaction):
 
@@ -84,9 +125,6 @@ versions cannot drift.
 ```
 docker-compose.yml          postgres + redis + mongo
 scripts/db.sh               stack and migration wrapper
-scripts/demo_booking.py     end-to-end walkthrough of the booking layer
-scripts/demo_day3.py        walkthrough of the cache + feedback store
-scripts/demo_analytics.py   walkthrough of the Day 4 analytical queries
 scripts/explain.py          EXPLAIN ANALYZE harness + index crossover study
 scripts/backfill_feedback.py  gives the seeded reviews real Mongo documents
 docs/er-diagram.md          ER diagram + normalization argument
@@ -100,6 +138,7 @@ sql/
   05_views.sql              read models for the analytics
   06_seed.sql               reproducible demo dataset (setseed)
   07_analytics.sql          window-function read models (rankings, demand)
+  98_explain.sql            guided EXPLAIN tour over this schema's own queries
   99_checks.sql             self-verifying invariant suite
 app/
   config.py                 env-driven settings
@@ -111,15 +150,17 @@ app/
   cache.py                  Redis availability cache (Day 3)
   feedback.py               MongoDB feedback store (Day 3)
   analytics.py              rankings, location search (Day 4)
-tests/                      89 tests incl. deterministic race proofs
+  cli.py                    `python -m app` — the whole backend from a terminal
+  webapp.py                 `python -m app serve` — the local web GUI's JSON API
+  static/index.html         the GUI itself, one self-contained page
+tests/                      108 tests incl. deterministic race proofs
 ```
 
 ## Python layer (Day 2)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest        # 89 tests
-.venv/bin/python scripts/demo_booking.py
+.venv/bin/python -m pytest        # 108 tests
 ```
 
 The Redis and MongoDB tests skip themselves if those services are down, so the
@@ -193,7 +234,6 @@ are discarded rather than recycled.
 
 ```bash
 .venv/bin/python scripts/backfill_feedback.py   # seeded reviews -> Mongo documents
-.venv/bin/python scripts/demo_day3.py           # cache + feedback walkthrough
 ```
 
 Both are opt-in at the call site. Nothing in the Day 1–2 core imports `redis` or
@@ -304,11 +344,24 @@ is genuinely the collection those reviews point into.
 ## Analytics and tuning (Day 4)
 
 ```bash
-.venv/bin/python scripts/demo_analytics.py      # the queries
 .venv/bin/python scripts/explain.py -n 15 --scale   # the measurements
 ```
 
 Full write-up with numbers: [`docs/performance.md`](docs/performance.md).
+
+To read the plans rather than the summary, `sql/98_explain.sql` is a guided tour
+of `EXPLAIN` over these same queries — estimate vs reality, how to read a plan
+tree, index vs sequential A/B on both indexes that earn their place, and why
+`ST_DWithin` is indexable when `ST_Distance(...) <= r` is not.
+
+```bash
+./scripts/db.sh psql -f /sql/98_explain.sql
+```
+
+Read-only, and plain SQL with no `psql` backslash commands, so it also runs a
+statement at a time in an IDE console — which is the better way to work through
+it. The two `BEGIN … ROLLBACK` blocks that disable index scans must be executed
+as a whole block rather than line by line.
 
 ### Per-city ranking
 
